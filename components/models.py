@@ -52,13 +52,13 @@ class Transaction(PolymorphicModel):
     date = models.DateField('transaction date', null=True)
     description = models.CharField(max_length=255)
     sub_description = models.CharField(max_length=500)
-    amount = models.DecimalField(max_digits=20, decimal_places=2)
+    amount = models.DecimalField(max_digits=20, decimal_places=2, null=True)
 
 
 @dataclass(init=False)
 class AccountTransaction(Transaction):
     # withdrawals are considered transaction amounts
-    deposits = models.DecimalField(max_digits=20, decimal_places=2)
+    deposits = models.DecimalField(max_digits=20, decimal_places=2, null=True)
     balance = models.DecimalField(max_digits=20, decimal_places=2)
 
 

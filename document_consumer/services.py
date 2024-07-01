@@ -12,7 +12,5 @@ def parse_statement(file_name):
         from document_consumer.uob.uob_parsers import parse_uob_statement
         parse_uob_statement(pages, first_page_last_line.split(' • '))
 
-    print(pages)
-
 
 parse_statement('C:\\Users\\AmideWing\\Downloads\\eStatement_50419.14378413525.pdf')
