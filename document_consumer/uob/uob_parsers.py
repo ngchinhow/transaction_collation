@@ -3,9 +3,14 @@ from datetime import datetime
 from decimal import Decimal
 from typing import List, cast
 
-from pdf_reader.custom_dataclasses import ExtractedPage, ExtractedTable, PdfParagraph, LineItem, BaseElementGroup
+from pdf_reader.custom_dataclasses import ExtractedPage, \
+    ExtractedTable, \
+    PdfParagraph, \
+    LineItem, \
+    BaseElementGroup, \
+    ExtractedPdfElement
 
-from components.models import FinancialInstitution, Address, InstrumentHolder, Account, AccountTransaction, Transaction
+from components.models import FinancialInstitution, Address, InstrumentHolder, Account, AccountTransaction
 
 
 def parse_uob_statement(file_name, pages: List[ExtractedPage], fi_information):
@@ -22,18 +27,18 @@ def parse_uob_statement(file_name, pages: List[ExtractedPage], fi_information):
 
     first_page_second_paragraph_elements = cast(PdfParagraph, pages[0].paragraphs[2]).elements
     if first_page_second_paragraph_elements[0].get_text() == 'Statement of Account':
-        parse_uob_account_statement(file_name, pages, fi, first_page_second_paragraph_elements[1].get_text())
+        parse_uob_account_statement(file_name, pages, fi)
 
 
-def parse_uob_account_statement(file_name, pages: List[ExtractedPage], fi: FinancialInstitution, period: str):
-    accounts, statement_year = parse_uob_account_metadata(pages[0], fi, period)
-    accounts_and_transactions = parse_uob_account_transactions(file_name, pages[1:-1], accounts, statement_year)
+def parse_uob_account_statement(file_name, pages: List[ExtractedPage], fi: FinancialInstitution):
+    accounts, statement_year = parse_uob_account_metadata(pages[0], fi)
+    accounts_and_transactions = parse_uob_account_transactions(file_name, pages[:-1], accounts, statement_year)
     print(accounts)
     print(statement_year)
     print(accounts_and_transactions)
 
 
-def parse_uob_account_metadata(first_page: ExtractedPage, fi: FinancialInstitution, period: str):
+def parse_uob_account_metadata(first_page: ExtractedPage, fi: FinancialInstitution):
     # Instrument holder name
     first_page_first_element_words = first_page.elements[0].get_text().split(' ')
     instrument_holder_name = ' '.join([word.capitalize() for word in first_page_first_element_words[1:]])
@@ -46,19 +51,51 @@ def parse_uob_account_metadata(first_page: ExtractedPage, fi: FinancialInstituti
     holder_address, holder_address_created = Address.objects.get_or_create(full_address=holder_address_text)
     holder, holder_created = InstrumentHolder.objects.get_or_create(full_name=instrument_holder_name,
                                                                     address=holder_address)
+    # Period
+    month_end_text = re.search('Account Overview as at (\\d{2} \\w{3} \\d{4})',
+                               cast(PdfParagraph, first_page.paragraphs[3]).text).group(1)
+    statement_year = datetime.strptime(month_end_text, '%d %b %Y').date().year
 
     # Accounts
-    first_page_seventh_paragraph_items = cast(ExtractedTable, first_page.paragraphs[6]).items
+    i = 4
+    account_category = set()
+    first_page_paragraphs = first_page.paragraphs
+    accounts = {}
+    while i < len(first_page_paragraphs):
+        paragraph_i = first_page_paragraphs[i]
+        if paragraph_i.get_text() not in account_category:
+            account_category.add(paragraph_i.get_text())
+            i += 1
+        else:
+            account_category.remove(paragraph_i.get_text())
+            accounts_at_y_coor = parse_uob_account_category_table(holder,
+                                                                  fi,
+                                                                  cast(ExtractedTable, first_page_paragraphs[i + 1]))
+            for j in range(len(accounts_at_y_coor)):
+                accounts = accounts | merge_uob_account_details(accounts_at_y_coor,
+                                                                cast(PdfParagraph, first_page_paragraphs[i + 2 + j]))
+            i += 2 + len(accounts_at_y_coor)
+
+        if not account_category:
+            break
+
+    return accounts, statement_year
+
+
+def parse_uob_account_category_table(holder: InstrumentHolder,
+                                     fi: FinancialInstitution,
+                                     account_type_table: ExtractedTable):
+    accounts = {}
     currency_x_begin_coor = None
     credit_line_x_end_coor = None
-    for group in first_page_seventh_paragraph_items[0].base_element_groups:
+    account_type_table_items = account_type_table.items
+    for group in account_type_table_items[0].base_element_groups:
         if group.text == 'Currency':
             currency_x_begin_coor = group.x0
         elif group.text == 'Credit Line':
             credit_line_x_end_coor = group.x1
 
-    accounts = {}
-    for account_table_line in first_page_seventh_paragraph_items[1:]:
+    for account_table_line in account_type_table_items[1:]:
         line_y_coor = account_table_line.el.y0
         balance = account_table_line.values[0].val_clean
         currency = None
@@ -78,106 +115,119 @@ def parse_uob_account_metadata(first_page: ExtractedPage, fi: FinancialInstituti
                 'balance': balance
             }
 
-    for account_detail_paragraph in first_page.paragraphs[7:7 + len(accounts)]:
-        account_detail_paragraph = cast(PdfParagraph, account_detail_paragraph)
-        account_dict = accounts.pop(account_detail_paragraph.elements[1].y0)
-        account_type, account_name, account_number = (account_detail_paragraph.text
-                                                      .split(account_detail_paragraph.line_break_char))
-        account, account_created = Account.objects.get_or_create(type=account_type,
-                                                                 name=account_name,
-                                                                 number=account_number,
-                                                                 **account_dict)
-        accounts[account_number] = account
+    return accounts
 
-    # Statement year
-    period_search = re.search('Period: .+ to (\\d{2} \\w{3} \\d{4})', period)
-    statement_year = datetime.strptime(period_search.group(1), '%d %b %Y').date().year
 
-    return accounts, statement_year
+def merge_uob_account_details(accounts_at_y_coor: dict, supplement_info: PdfParagraph):
+    account_dict = accounts_at_y_coor.pop(supplement_info.elements[1].y0)
+    account_type, account_name, account_number = (supplement_info.text
+                                                  .split(supplement_info.line_break_char))
+    account, account_created = Account.objects.get_or_create(type=account_type,
+                                                             name=account_name,
+                                                             number=account_number,
+                                                             **account_dict)
+    return {account_number: account}
 
 
 def parse_uob_account_transactions(file_name, pages: List[ExtractedPage], accounts: dict, year: int):
     accounts_with_transactions = {}
+    found_end_of_summary = False
+    found_end_of_transactions = False
+
     for page in pages:
-        transaction_table = cast(ExtractedTable, page.elements[0])
-        transaction_table_area = transaction_table.table_area
-        transaction_table_x_begin_coor = transaction_table_area.x0
-        transaction_table_x_end_coor = transaction_table_area.x1
-        transaction_table_y_begin_coor = transaction_table_area.y0
-        transaction_table_y_end_coor = transaction_table_area.y1
+        transaction_tables = []
+        for element in page.elements:
+            if found_end_of_summary and not found_end_of_transactions:
+                if isinstance(element, ExtractedTable):
+                    table_area = element.table_area
+                    transaction_tables.append({
+                        'table': element,
+                        'table_x_begin_coor': table_area.x0,
+                        'table_x_end_coor': table_area.x1,
+                        'table_y_begin_coor': table_area.y0,
+                        'table_y_end_coor': table_area.y1,
+                        'excluded_groups': []
+                    })
+                else:
+                    for table_properties in transaction_tables:
+                        if (element.x0 >= table_properties['table_x_begin_coor'] and
+                                element.x1 <= table_properties['table_x_end_coor'] and
+                                element.y0 >= table_properties['table_y_begin_coor'] and
+                                element.y1 <= table_properties['table_y_end_coor']):
+                            table_properties['excluded_groups'].append(element.el)
 
-        excluded_table_base_element_groups: List[BaseElementGroup] = []
-        for page_element in page.elements[1:]:
-            if (page_element.x0 >= transaction_table_x_begin_coor and
-                    page_element.x1 <= transaction_table_x_end_coor and
-                    page_element.y0 >= transaction_table_y_begin_coor and
-                    page_element.y1 <= transaction_table_y_end_coor):
-                excluded_table_base_element_groups.append(cast(BaseElementGroup, page_element.el))
+            if (type(element) is ExtractedPdfElement and
+                    element.el.text == '----------------------------------------------------------------- End of Summary------------------------------------------------------------'):
+                found_end_of_summary = True
+            elif (type(element) is ExtractedPdfElement and
+                  element.el.text == '------------------------------------------------------------ End of Transaction Details-------------------------------------------------------'):
+                found_end_of_transactions = True
 
-        transactions_table_items = transaction_table.items
+        for table_properties in transaction_tables:
+            transactions_table_items = table_properties['table'].items
 
-        account_number = re.search('.+ ([\\d-]+).*', transactions_table_items[2].el.text).group(1)
-        if account_number not in accounts_with_transactions:
-            accounts_with_transactions[account_number] = []
+            account_number = re.search('.+ ([\\d-]+).*', transactions_table_items[2].el.text).group(1)
+            if account_number not in accounts_with_transactions:
+                accounts_with_transactions[account_number] = []
 
-        # Table header row
-        header_row = transactions_table_items[3]
-        header_groups = merge_row_groups(excluded_table_base_element_groups, header_row)
-        assert len(header_groups) == 5  # UOB transaction table has 5 columns
+            # Table header row
+            header_row = transactions_table_items[3]
+            header_groups = merge_row_groups(table_properties['excluded_groups'], header_row)
+            assert len(header_groups) == 5  # UOB transaction table has 5 columns
 
-        date_x_begin_coor = header_groups[0].x0
-        description_x_begin_coor = header_groups[1].x0
-        withdrawals_x_end_coor = header_groups[2].x1
-        deposits_x_end_coor = header_groups[3].x1
-        balance_x_end_coor = header_groups[4].x1
+            date_x_begin_coor = header_groups[0].x0
+            description_x_begin_coor = header_groups[1].x0
+            withdrawals_x_end_coor = header_groups[2].x1
+            deposits_x_end_coor = header_groups[3].x1
+            balance_x_end_coor = header_groups[4].x1
 
-        transaction = None
-        transaction_sub_description_rows = []
-        # Skip row 5
-        for item in transactions_table_items[5:]:
-            date = None
-            description = ''
-            withdrawals = None
-            deposits = None
-            balance = None
-            # Make new transaction
-            row_groups = merge_row_groups(excluded_table_base_element_groups, item)
-            for group in row_groups:
-                if abs(group.x0 - date_x_begin_coor) < 3:
-                    date = datetime.strptime(f'{group.text} {year}', '%d %b %Y')
-                elif abs(group.x0 - description_x_begin_coor) < 3:
-                    description = group.text
-                elif abs(group.x1 - withdrawals_x_end_coor) < 3:
-                    withdrawals = Decimal(group.text.replace(',', ''))
-                elif abs(group.x1 - deposits_x_end_coor) < 3:
-                    deposits = Decimal(group.text.replace(',', ''))
-                elif abs(group.x1 - balance_x_end_coor) < 3:
-                    balance = Decimal(group.text.replace(',', ''))
+            transaction = None
+            transaction_sub_description_rows = []
+            # Skip row 5
+            for item in transactions_table_items[5:]:
+                date = None
+                description = ''
+                withdrawals = None
+                deposits = None
+                balance = None
+                # Make new transaction
+                row_groups = merge_row_groups(table_properties['excluded_groups'], item)
+                for group in row_groups:
+                    if abs(group.x0 - date_x_begin_coor) < 3:
+                        date = datetime.strptime(f'{group.text} {year}', '%d %b %Y')
+                    elif abs(group.x0 - description_x_begin_coor) < 3:
+                        description = group.text
+                    elif abs(group.x1 - withdrawals_x_end_coor) < 3:
+                        withdrawals = Decimal(group.text.replace(',', ''))
+                    elif abs(group.x1 - deposits_x_end_coor) < 3:
+                        deposits = Decimal(group.text.replace(',', ''))
+                    elif abs(group.x1 - balance_x_end_coor) < 3:
+                        balance = Decimal(group.text.replace(',', ''))
 
-            if balance is not None:
-                if transaction is not None:
-                    # Add previous transaction to list
-                    add_transaction_to_list(accounts_with_transactions[account_number],
-                                            transaction,
-                                            transaction_sub_description_rows)
-                    transaction_sub_description_rows = []
+                if balance is not None:
+                    if transaction is not None:
+                        # Add previous transaction to list
+                        add_transaction_to_list(accounts_with_transactions[account_number],
+                                                transaction,
+                                                transaction_sub_description_rows)
+                        transaction_sub_description_rows = []
 
-                transaction, transaction_created = (AccountTransaction.objects
-                                                    .get_or_create(account=accounts[account_number],
-                                                                   date=date,
-                                                                   description=description,
-                                                                   amount=withdrawals,
-                                                                   deposits=deposits,
-                                                                   balance=balance,
-                                                                   file_name=file_name))
-            else:
-                # sub-description is contained in the description column
-                transaction_sub_description_rows.append(description)
+                    transaction, transaction_created = (AccountTransaction.objects
+                                                        .get_or_create(account=accounts[account_number],
+                                                                       date=date,
+                                                                       description=description,
+                                                                       amount=withdrawals,
+                                                                       deposits=deposits,
+                                                                       balance=balance,
+                                                                       file_name=file_name))
+                else:
+                    # sub-description is contained in the description column
+                    transaction_sub_description_rows.append(description)
 
-        # Add last transaction to list
-        add_transaction_to_list(accounts_with_transactions[account_number],
-                                transaction,
-                                transaction_sub_description_rows)
+            # Add last transaction to list
+            add_transaction_to_list(accounts_with_transactions[account_number],
+                                    transaction,
+                                    transaction_sub_description_rows)
 
     return accounts_with_transactions
 
