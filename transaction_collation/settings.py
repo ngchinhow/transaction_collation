@@ -31,7 +31,6 @@ ALLOWED_HOSTS = []
 # Application definition
 
 INSTALLED_APPS = [
-    'polymorphic',
     'document_consumer.apps.DocumentConsumerConfig',
     'components.apps.ComponentsConfig',
     'django.contrib.admin',

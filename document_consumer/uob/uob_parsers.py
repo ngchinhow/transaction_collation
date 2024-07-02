@@ -8,23 +8,26 @@ from pdf_reader.custom_dataclasses import ExtractedPage, ExtractedTable, PdfPara
 from components.models import FinancialInstitution, Address, InstrumentHolder, Account, AccountTransaction, Transaction
 
 
-def parse_uob_statement(pages: List[ExtractedPage], fi_information):
-    fi_address = Address(full_address=fi_information[1])
-    fi = FinancialInstitution(full_name=fi_information[0],
-                              abbreviation='UOB',
-                              address=fi_address,
-                              company_registration_number=fi_information[2].replace('Co. Reg. No. ', ''),
-                              gst_registration_number=fi_information[3].replace('GST Reg. No. ', ''),
-                              email=fi_information[4])
+def parse_uob_statement(file_name, pages: List[ExtractedPage], fi_information):
+    fi_address, fi_address_created = Address.objects.get_or_create(full_address=fi_information[1])
+
+    company_registration_number = fi_information[2].replace('Co. Reg. No. ', '')
+    gst_registration_number = fi_information[3].replace('GST Reg. No. ', '')
+    fi, fi_created = FinancialInstitution.objects.get_or_create(full_name=fi_information[0],
+                                                                abbreviation='UOB',
+                                                                address=fi_address,
+                                                                company_registration_number=company_registration_number,
+                                                                gst_registration_number=gst_registration_number,
+                                                                email=fi_information[4])
 
     first_page_second_paragraph_elements = cast(PdfParagraph, pages[0].paragraphs[2]).elements
     if first_page_second_paragraph_elements[0].get_text() == 'Statement of Account':
-        parse_uob_account_statement(pages, fi, first_page_second_paragraph_elements[1].get_text())
+        parse_uob_account_statement(file_name, pages, fi, first_page_second_paragraph_elements[1].get_text())
 
 
-def parse_uob_account_statement(pages: List[ExtractedPage], fi: FinancialInstitution, period: str):
+def parse_uob_account_statement(file_name, pages: List[ExtractedPage], fi: FinancialInstitution, period: str):
     accounts, statement_year = parse_uob_account_metadata(pages[0], fi, period)
-    accounts_and_transactions = parse_uob_account_transactions(pages[1:-1], accounts, statement_year)
+    accounts_and_transactions = parse_uob_account_transactions(file_name, pages[1:-1], accounts, statement_year)
     print(accounts)
     print(statement_year)
     print(accounts_and_transactions)
@@ -39,9 +42,10 @@ def parse_uob_account_metadata(first_page: ExtractedPage, fi: FinancialInstituti
     first_page_third_element = first_page.elements[2].get_text()
     for item in cast(ExtractedTable, first_page.elements[3]).items:
         first_page_third_element += ' ' + item.el.text.replace(' Call', '')
-    instrument_holder_address_text = ' '.join([word.capitalize() for word in first_page_third_element.split(' ')])
-    instrument_holder_address = Address(full_address=instrument_holder_address_text)
-    instrument_holder = InstrumentHolder(full_name=instrument_holder_name, address=instrument_holder_address)
+    holder_address_text = ' '.join([word.capitalize() for word in first_page_third_element.split(' ')])
+    holder_address, holder_address_created = Address.objects.get_or_create(full_address=holder_address_text)
+    holder, holder_created = InstrumentHolder.objects.get_or_create(full_name=instrument_holder_name,
+                                                                    address=holder_address)
 
     # Accounts
     first_page_seventh_paragraph_items = cast(ExtractedTable, first_page.paragraphs[6]).items
@@ -56,7 +60,7 @@ def parse_uob_account_metadata(first_page: ExtractedPage, fi: FinancialInstituti
     accounts = {}
     for account_table_line in first_page_seventh_paragraph_items[1:]:
         line_y_coor = account_table_line.el.y0
-        balance = account_table_line.values[0]
+        balance = account_table_line.values[0].val_clean
         currency = None
         credit_line = None
         for group in account_table_line.base_element_groups:
@@ -66,21 +70,23 @@ def parse_uob_account_metadata(first_page: ExtractedPage, fi: FinancialInstituti
                 credit_line = Decimal(group.text)
 
         if currency is not None:
-            accounts[line_y_coor] = Account(holder=instrument_holder,
-                                            provider=fi,
-                                            currency=currency,
-                                            credit_line=credit_line,
-                                            balance=balance)
+            accounts[line_y_coor] = {
+                'holder': holder,
+                'provider': fi,
+                'currency': currency,
+                'credit_line': credit_line,
+                'balance': balance
+            }
 
     for account_detail_paragraph in first_page.paragraphs[7:7 + len(accounts)]:
         account_detail_paragraph = cast(PdfParagraph, account_detail_paragraph)
-        account = accounts.pop(account_detail_paragraph.elements[1].y0)
+        account_dict = accounts.pop(account_detail_paragraph.elements[1].y0)
         account_type, account_name, account_number = (account_detail_paragraph.text
                                                       .split(account_detail_paragraph.line_break_char))
-        account.type = account_type
-        account.name = account_name
-        account.number = account_number
-
+        account, account_created = Account.objects.get_or_create(type=account_type,
+                                                                 name=account_name,
+                                                                 number=account_number,
+                                                                 **account_dict)
         accounts[account_number] = account
 
     # Statement year
@@ -90,7 +96,7 @@ def parse_uob_account_metadata(first_page: ExtractedPage, fi: FinancialInstituti
     return accounts, statement_year
 
 
-def parse_uob_account_transactions(pages: List[ExtractedPage], accounts: dict, year: int):
+def parse_uob_account_transactions(file_name, pages: List[ExtractedPage], accounts: dict, year: int):
     accounts_with_transactions = {}
     for page in pages:
         transaction_table = cast(ExtractedTable, page.elements[0])
@@ -125,7 +131,7 @@ def parse_uob_account_transactions(pages: List[ExtractedPage], accounts: dict, y
         deposits_x_end_coor = header_groups[3].x1
         balance_x_end_coor = header_groups[4].x1
 
-        account_transaction = None
+        transaction = None
         transaction_sub_description_rows = []
         # Skip row 5
         for item in transactions_table_items[5:]:
@@ -149,26 +155,28 @@ def parse_uob_account_transactions(pages: List[ExtractedPage], accounts: dict, y
                     balance = Decimal(group.text.replace(',', ''))
 
             if balance is not None:
-                if account_transaction is not None:
+                if transaction is not None:
                     # Add previous transaction to list
                     add_transaction_to_list(accounts_with_transactions[account_number],
-                                            account_transaction,
+                                            transaction,
                                             transaction_sub_description_rows)
                     transaction_sub_description_rows = []
 
-                account_transaction = AccountTransaction(instrument=accounts[account_number],
-                                                         date=date,
-                                                         description=description,
-                                                         amount=withdrawals,
-                                                         deposits=deposits,
-                                                         balance=balance)
+                transaction, transaction_created = (AccountTransaction.objects
+                                                    .get_or_create(account=accounts[account_number],
+                                                                   date=date,
+                                                                   description=description,
+                                                                   amount=withdrawals,
+                                                                   deposits=deposits,
+                                                                   balance=balance,
+                                                                   file_name=file_name))
             else:
                 # sub-description is contained in the description column
                 transaction_sub_description_rows.append(description)
 
         # Add last transaction to list
         add_transaction_to_list(accounts_with_transactions[account_number],
-                                account_transaction,
+                                transaction,
                                 transaction_sub_description_rows)
 
     return accounts_with_transactions
@@ -191,6 +199,11 @@ def merge_row_groups(excluded_groups: List[BaseElementGroup], item: LineItem):
     return groups
 
 
-def add_transaction_to_list(transactions: List[Transaction], transaction: Transaction, sub_description_rows: List[str]):
-    transaction.sub_description = '\n'.join(sub_description_rows)
+def add_transaction_to_list(transactions: List[AccountTransaction],
+                            transaction: AccountTransaction,
+                            sub_description_rows: List[str]):
+    sub_description = '\n'.join(sub_description_rows)
+    transaction.sub_description = sub_description
+    transaction.row_number = len(transactions) + 1  # 1 begin list index
+    transaction.save()
     transactions.append(transaction)
