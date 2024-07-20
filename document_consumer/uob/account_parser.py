@@ -13,23 +13,6 @@ from pdf_reader.custom_dataclasses import ExtractedPage, \
 from components.models import FinancialInstitution, Address, InstrumentHolder, Account, AccountTransaction
 
 
-def parse_uob_statement(file_name, pages: List[ExtractedPage], fi_information):
-    fi_address, fi_address_created = Address.objects.get_or_create(full_address=fi_information[1])
-
-    company_registration_number = fi_information[2].replace('Co. Reg. No. ', '')
-    gst_registration_number = fi_information[3].replace('GST Reg. No. ', '')
-    fi, fi_created = FinancialInstitution.objects.get_or_create(full_name=fi_information[0],
-                                                                abbreviation='UOB',
-                                                                address=fi_address,
-                                                                company_registration_number=company_registration_number,
-                                                                gst_registration_number=gst_registration_number,
-                                                                email=fi_information[4])
-
-    first_page_second_paragraph_elements = cast(PdfParagraph, pages[0].paragraphs[2]).elements
-    if first_page_second_paragraph_elements[0].get_text() == 'Statement of Account':
-        parse_uob_account_statement(file_name, pages, fi)
-
-
 def parse_uob_account_statement(file_name, pages: List[ExtractedPage], fi: FinancialInstitution):
     accounts, statement_year = parse_uob_account_metadata(pages[0], fi)
     accounts_and_transactions = parse_uob_account_transactions(file_name, pages[:-1], accounts, statement_year)
@@ -46,11 +29,12 @@ def parse_uob_account_metadata(first_page: ExtractedPage, fi: FinancialInstituti
     # Instrument holder address
     first_page_third_element = first_page.elements[2].get_text()
     for item in cast(ExtractedTable, first_page.elements[3]).items:
-        first_page_third_element += ' ' + item.el.text.replace(' Call', '')
+        first_page_third_element += ' ' + item.base_element_groups.pop().text
     holder_address_text = ' '.join([word.capitalize() for word in first_page_third_element.split(' ')])
     holder_address, holder_address_created = Address.objects.get_or_create(full_address=holder_address_text)
     holder, holder_created = InstrumentHolder.objects.get_or_create(full_name=instrument_holder_name,
                                                                     address=holder_address)
+
     # Period
     month_end_text = re.search('Account Overview as at (\\d{2} \\w{3} \\d{4})',
                                cast(PdfParagraph, first_page.paragraphs[3]).text).group(1)
@@ -64,19 +48,23 @@ def parse_uob_account_metadata(first_page: ExtractedPage, fi: FinancialInstituti
     while i < len(first_page_paragraphs):
         paragraph_i = first_page_paragraphs[i]
         if paragraph_i.get_text() not in account_category:
+            # Add text as a new category
             account_category.add(paragraph_i.get_text())
             i += 1
         else:
             account_category.remove(paragraph_i.get_text())
+            # Parse currency to balance columns for particular category
             accounts_at_y_coor = parse_uob_account_category_table(holder,
                                                                   fi,
                                                                   cast(ExtractedTable, first_page_paragraphs[i + 1]))
+            # Join account details to currency, etc details using y coordinate
             for j in range(len(accounts_at_y_coor)):
                 accounts = accounts | merge_uob_account_details(accounts_at_y_coor,
                                                                 cast(PdfParagraph, first_page_paragraphs[i + 2 + j]))
             i += 2 + len(accounts_at_y_coor)
 
         if not account_category:
+            # No more categories to cover
             break
 
     return accounts, statement_year
@@ -120,12 +108,18 @@ def parse_uob_account_category_table(holder: InstrumentHolder,
 
 def merge_uob_account_details(accounts_at_y_coor: dict, supplement_info: PdfParagraph):
     account_dict = accounts_at_y_coor.pop(supplement_info.elements[1].y0)
+    holder = account_dict.pop('holder')
+    provider = account_dict.pop('provider')
+    currency = account_dict.pop('currency')
     account_type, account_name, account_number = (supplement_info.text
                                                   .split(supplement_info.line_break_char))
-    account, account_created = Account.objects.get_or_create(type=account_type,
-                                                             name=account_name,
-                                                             number=account_number,
-                                                             **account_dict)
+    account, account_created = Account.objects.update_or_create(type=account_type,
+                                                                name=account_name,
+                                                                number=account_number,
+                                                                holder=holder,
+                                                                provider=provider,
+                                                                currency=currency,
+                                                                defaults=account_dict)
     return {account_number: account}
 
 
