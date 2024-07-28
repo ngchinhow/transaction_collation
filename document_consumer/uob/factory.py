@@ -17,7 +17,7 @@ def parse_uob_statement(file_name, pages: List[ExtractedPage], fi_information):
                                                                 address=fi_address,
                                                                 company_registration_number=company_registration_number,
                                                                 gst_registration_number=gst_registration_number,
-                                                                email=fi_information[4])
+                                                                website=fi_information[4])
 
     first_page_second_paragraph_first_element_text = cast(PdfParagraph, pages[0].paragraphs[2]).elements[0].get_text()
     match first_page_second_paragraph_first_element_text:

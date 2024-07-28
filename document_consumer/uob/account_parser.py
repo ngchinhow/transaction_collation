@@ -3,6 +3,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import List, cast
 
+from django.contrib.contenttypes.models import ContentType
 from pdf_reader.custom_dataclasses import ExtractedPage, \
     ExtractedTable, \
     PdfParagraph, \
@@ -10,18 +11,24 @@ from pdf_reader.custom_dataclasses import ExtractedPage, \
     BaseElementGroup, \
     ExtractedPdfElement
 
-from components.models import FinancialInstitution, Address, InstrumentHolder, Account, AccountTransaction
+from components.models import FinancialInstitution, \
+    Address, \
+    InstrumentHolder, \
+    Account, \
+    AccountTransaction, \
+    Statement, \
+    InstrumentStatement, AccountSnapshot
 
 
 def parse_uob_account_statement(file_name, pages: List[ExtractedPage], fi: FinancialInstitution):
-    accounts, statement_year = parse_uob_account_metadata(pages[0], fi)
-    accounts_and_transactions = parse_uob_account_transactions(file_name, pages[:-1], accounts, statement_year)
-    print(accounts)
+    account_snapshots, statement_year = parse_uob_account_metadata(file_name, pages[0], fi)
+    accounts_and_transactions = parse_uob_account_transactions(pages[:-1], account_snapshots, statement_year)
+    print(account_snapshots)
     print(statement_year)
     print(accounts_and_transactions)
 
 
-def parse_uob_account_metadata(first_page: ExtractedPage, fi: FinancialInstitution):
+def parse_uob_account_metadata(file_name: str, first_page: ExtractedPage, fi: FinancialInstitution):
     # Instrument holder name
     first_page_first_element_words = first_page.elements[0].get_text().split(' ')
     instrument_holder_name = ' '.join([word.capitalize() for word in first_page_first_element_words[1:]])
@@ -38,13 +45,20 @@ def parse_uob_account_metadata(first_page: ExtractedPage, fi: FinancialInstituti
     # Period
     month_end_text = re.search('Account Overview as at (\\d{2} \\w{3} \\d{4})',
                                cast(PdfParagraph, first_page.paragraphs[3]).text).group(1)
-    statement_year = datetime.strptime(month_end_text, '%d %b %Y').date().year
+    statement_date = datetime.strptime(month_end_text, '%d %b %Y').date()
+    statement, statement_created = Statement.objects.get_or_create(holder=holder,
+                                                                   provider=fi,
+                                                                   date=statement_date,
+                                                                   type=Statement.InstrumentType.ACCOUNT,
+                                                                   defaults={'file_name': file_name})
+    statement_year = statement_date.year
 
     # Accounts
     i = 4
     account_category = set()
     first_page_paragraphs = first_page.paragraphs
-    accounts = {}
+    account_snapshots = {}
+    account_content_type = ContentType.objects.get_for_model(Account)
     while i < len(first_page_paragraphs):
         paragraph_i = first_page_paragraphs[i]
         if paragraph_i.get_text() not in account_category:
@@ -57,17 +71,20 @@ def parse_uob_account_metadata(first_page: ExtractedPage, fi: FinancialInstituti
             accounts_at_y_coor = parse_uob_account_category_table(holder,
                                                                   fi,
                                                                   cast(ExtractedTable, first_page_paragraphs[i + 1]))
-            # Join account details to currency, etc details using y coordinate
+            # Join account details to currency, etc. details using y coordinate
             for j in range(len(accounts_at_y_coor)):
-                accounts = accounts | merge_uob_account_details(accounts_at_y_coor,
-                                                                cast(PdfParagraph, first_page_paragraphs[i + 2 + j]))
+                account_snapshots = (account_snapshots |
+                                     merge_uob_account_details(statement,
+                                                               account_content_type,
+                                                               accounts_at_y_coor,
+                                                               cast(PdfParagraph, first_page_paragraphs[i + 2 + j])))
             i += 2 + len(accounts_at_y_coor)
 
         if not account_category:
             # No more categories to cover
             break
 
-    return accounts, statement_year
+    return account_snapshots, statement_year
 
 
 def parse_uob_account_category_table(holder: InstrumentHolder,
@@ -106,27 +123,37 @@ def parse_uob_account_category_table(holder: InstrumentHolder,
     return accounts
 
 
-def merge_uob_account_details(accounts_at_y_coor: dict, supplement_info: PdfParagraph):
+def merge_uob_account_details(statement: Statement,
+                              account_content_type: ContentType,
+                              accounts_at_y_coor: dict,
+                              supplement_info: PdfParagraph):
     account_dict = accounts_at_y_coor.pop(supplement_info.elements[1].y0)
     holder = account_dict.pop('holder')
     provider = account_dict.pop('provider')
     currency = account_dict.pop('currency')
     account_type, account_name, account_number = (supplement_info.text
                                                   .split(supplement_info.line_break_char))
-    account, account_created = Account.objects.update_or_create(type=account_type,
-                                                                name=account_name,
-                                                                number=account_number,
-                                                                holder=holder,
-                                                                provider=provider,
-                                                                currency=currency,
-                                                                defaults=account_dict)
-    return {account_number: account}
+    account, account_created = Account.objects.get_or_create(type=account_type,
+                                                             name=account_name,
+                                                             number=account_number,
+                                                             holder=holder,
+                                                             provider=provider,
+                                                             currency=currency)
+    account_statement, account_statement_created = (InstrumentStatement.objects
+                                                    .get_or_create(instrument_content_type=account_content_type,
+                                                                   instrument_id=account.id,
+                                                                   statement=statement))
+    account_snapshot, account_snapshot_created = (AccountSnapshot.objects
+                                                  .get_or_create(instrument_statement=account_statement,
+                                                                 defaults=account_dict))
+    return {account_number: account_snapshot}
 
 
-def parse_uob_account_transactions(file_name, pages: List[ExtractedPage], accounts: dict, year: int):
+def parse_uob_account_transactions(pages: List[ExtractedPage], account_snapshots: dict, year: int):
     accounts_with_transactions = {}
     found_end_of_summary = False
     found_end_of_transactions = False
+    account_snapshot_content_type = ContentType.objects.get_for_model(AccountSnapshot)
 
     for page in pages:
         transaction_tables = []
@@ -157,6 +184,7 @@ def parse_uob_account_transactions(file_name, pages: List[ExtractedPage], accoun
                   element.el.text == '------------------------------------------------------------ End of Transaction Details-------------------------------------------------------'):
                 found_end_of_transactions = True
 
+        # Create transactions for one account
         for table_properties in transaction_tables:
             transactions_table_items = table_properties['table'].items
 
@@ -203,17 +231,18 @@ def parse_uob_account_transactions(file_name, pages: List[ExtractedPage], accoun
                         # Add previous transaction to list
                         add_transaction_to_list(accounts_with_transactions[account_number],
                                                 transaction,
+                                                account_snapshot_content_type,
                                                 transaction_sub_description_rows)
                         transaction_sub_description_rows = []
 
-                    transaction, transaction_created = (AccountTransaction.objects
-                                                        .get_or_create(account=accounts[account_number],
-                                                                       date=date,
-                                                                       description=description,
-                                                                       amount=withdrawals,
-                                                                       deposits=deposits,
-                                                                       balance=balance,
-                                                                       file_name=file_name))
+                    transaction = {
+                        'snapshot': account_snapshots[account_number],
+                        'date': date,
+                        'description': description,
+                        'amount': withdrawals,
+                        'deposits': deposits,
+                        'balance': balance
+                    }
                 else:
                     # sub-description is contained in the description column
                     transaction_sub_description_rows.append(description)
@@ -221,6 +250,7 @@ def parse_uob_account_transactions(file_name, pages: List[ExtractedPage], accoun
             # Add last transaction to list
             add_transaction_to_list(accounts_with_transactions[account_number],
                                     transaction,
+                                    account_snapshot_content_type,
                                     transaction_sub_description_rows)
 
     return accounts_with_transactions
@@ -244,10 +274,15 @@ def merge_row_groups(excluded_groups: List[BaseElementGroup], item: LineItem):
 
 
 def add_transaction_to_list(transactions: List[AccountTransaction],
-                            transaction: AccountTransaction,
+                            transaction_dict: dict,
+                            account_snapshot_content_type: ContentType,
                             sub_description_rows: List[str]):
+    account_snapshot = transaction_dict.pop('snapshot')
     sub_description = '\n'.join(sub_description_rows)
-    transaction.sub_description = sub_description
-    transaction.row_number = len(transactions) + 1  # 1 begin list index
-    transaction.save()
+    transaction_dict['sub_description'] = sub_description
+    transaction, transaction_created = (AccountTransaction.objects
+                                        .get_or_create(snapshot_content_type=account_snapshot_content_type,
+                                                       snapshot_id=account_snapshot.id,
+                                                       row_number=len(transactions) + 1,  # 1 begin list index
+                                                       defaults=transaction_dict))
     transactions.append(transaction)
