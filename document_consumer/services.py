@@ -31,4 +31,4 @@ def parse_statement(file_name):
                 parse_posb_account_transactions(file_stem, InstrumentHolder.objects.get(pk=1), 'SGD', collected_rows)
 
 
-parse_statement('C:\\Users\\AmideWing\\Downloads\\c177d2d42da4b21c8b2d02192aa3a08b.P000000021437251.csv')
+parse_statement('C:\\Users\\AmideWing\\Downloads\\eStatement_1732.154630424469.pdf')

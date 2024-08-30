@@ -146,6 +146,7 @@ def merge_uob_account_details(statement: Statement,
     account_snapshot, account_snapshot_created = (AccountSnapshot.objects
                                                   .get_or_create(instrument_statement=account_statement,
                                                                  defaults=account_dict))
+
     return {account_number: account_snapshot}
 
 

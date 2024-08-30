@@ -1,22 +1,25 @@
-from dataclasses import dataclass
-
 from django.contrib.contenttypes.fields import GenericForeignKey
 from django.contrib.contenttypes.models import ContentType
 from django.db import models
 from django.utils.translation import gettext_lazy as _
 
 
-@dataclass(init=False)
-# Create your models here.
-class Address(models.Model):
+class LoggableModel(models.Model):
+    def __repr__(self):
+        return repr({k: str(v) for k, v in vars(self).items() if k != '_state'})
+
+    class Meta:
+        abstract = True
+
+
+class Address(LoggableModel):
     full_address = models.CharField(max_length=255, unique=True)
 
     class Meta:
         db_table = 'project_address'
 
 
-@dataclass(init=False)
-class FinancialInstitution(models.Model):
+class FinancialInstitution(LoggableModel):
     full_name = models.CharField(max_length=255, null=True)
     abbreviation = models.CharField(max_length=5)
     address = models.ForeignKey(Address, null=True, on_delete=models.SET_NULL)
@@ -31,8 +34,7 @@ class FinancialInstitution(models.Model):
         ]
 
 
-@dataclass(init=False)
-class InstrumentHolder(models.Model):
+class InstrumentHolder(LoggableModel):
     full_name = models.CharField(max_length=255)
     address = models.ForeignKey(Address, null=True, on_delete=models.SET_NULL)
 
@@ -43,8 +45,7 @@ class InstrumentHolder(models.Model):
         ]
 
 
-@dataclass(init=False)
-class Statement(models.Model):
+class Statement(LoggableModel):
     class InstrumentType(models.TextChoices):
         ACCOUNT = 'ACCOUNT', _('Account')
         CARD = 'CARD', _('Card')
@@ -62,8 +63,7 @@ class Statement(models.Model):
         ]
 
 
-@dataclass(init=False)
-class InstrumentStatement(models.Model):
+class InstrumentStatement(LoggableModel):
     statement = models.ForeignKey(Statement, on_delete=models.CASCADE)
     instrument_content_type = models.ForeignKey(ContentType, null=True, on_delete=models.SET_NULL)
     instrument_id = models.PositiveIntegerField()
@@ -77,8 +77,7 @@ class InstrumentStatement(models.Model):
         ]
 
 
-@dataclass(init=False)
-class Instrument(models.Model):
+class Instrument(LoggableModel):
     holder = models.ForeignKey(InstrumentHolder, null=True, on_delete=models.SET_NULL)
     provider = models.ForeignKey(FinancialInstitution, null=True, on_delete=models.SET_NULL)
     name = models.CharField(max_length=255)
@@ -89,7 +88,6 @@ class Instrument(models.Model):
         abstract = True
 
 
-@dataclass(init=False)
 class Account(Instrument):
     type = models.CharField(max_length=10)
 
@@ -101,7 +99,6 @@ class Account(Instrument):
         ]
 
 
-@dataclass(init=False)
 class Card(Instrument):
     class Meta:
         db_table = 'project_card'
@@ -110,15 +107,13 @@ class Card(Instrument):
         ]
 
 
-@dataclass(init=False)
-class Snapshot(models.Model):
+class Snapshot(LoggableModel):
     instrument_statement = models.ForeignKey(InstrumentStatement, on_delete=models.CASCADE)
 
     class Meta:
         abstract = True
 
 
-@dataclass(init=False)
 class AccountSnapshot(Snapshot):
     credit_line = models.DecimalField(max_digits=20, decimal_places=2)
     balance = models.DecimalField(max_digits=20, decimal_places=2)
@@ -127,7 +122,6 @@ class AccountSnapshot(Snapshot):
         db_table = 'project_account_snapshot'
 
 
-@dataclass(init=False)
 class CardSnapshot(Snapshot):
     total_credit_limit = models.PositiveIntegerField('total credit limit')
 
@@ -135,8 +129,7 @@ class CardSnapshot(Snapshot):
         db_table = 'project_card_snapshot'
 
 
-@dataclass(init=False)
-class Transaction(models.Model):
+class Transaction(LoggableModel):
     date = models.DateField('transaction date', null=True)
     description = models.CharField(max_length=255)
     sub_description = models.CharField(max_length=500)
@@ -154,7 +147,6 @@ class Transaction(models.Model):
         ]
 
 
-@dataclass(init=False)
 class AccountTransaction(Transaction):
     # withdrawals are considered transaction amounts
     deposits = models.DecimalField(max_digits=20, decimal_places=2, null=True)
@@ -164,7 +156,6 @@ class AccountTransaction(Transaction):
         db_table = 'project_account_transaction'
 
 
-@dataclass(init=False)
 class CardTransaction(Transaction):
     # transaction date is the date used for base transactions
     post_date = models.DateField('post date', null=True)
