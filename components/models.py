@@ -100,6 +100,8 @@ class Account(Instrument):
 
 
 class Card(Instrument):
+    parent = models.ForeignKey("self", null=True, on_delete=models.SET_NULL)
+
     class Meta:
         db_table = 'project_card'
         constraints = [
