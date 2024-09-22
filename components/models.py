@@ -82,20 +82,20 @@ class Instrument(LoggableModel):
     provider = models.ForeignKey(FinancialInstitution, null=True, on_delete=models.SET_NULL)
     name = models.CharField(max_length=255)
     number = models.CharField(max_length=20)
-    currency = models.CharField(max_length=3)
+    currency = models.CharField(max_length=3, null=True)
 
     class Meta:
         abstract = True
 
 
 class Account(Instrument):
-    type = models.CharField(max_length=10)
+    type = models.CharField(max_length=10, null=True)
 
     class Meta:
         db_table = 'project_account'
         constraints = [
             models.UniqueConstraint(name='unique_account',
-                                    fields=['holder', 'provider', 'name', 'number', 'currency', 'type'])
+                                    fields=['holder', 'provider', 'name', 'number'])
         ]
 
 
@@ -117,7 +117,7 @@ class Snapshot(LoggableModel):
 
 
 class AccountSnapshot(Snapshot):
-    credit_line = models.DecimalField(max_digits=20, decimal_places=2)
+    credit_line = models.DecimalField(max_digits=20, decimal_places=2, null=True)
     balance = models.DecimalField(max_digits=20, decimal_places=2)
 
     class Meta:

@@ -133,12 +133,14 @@ def merge_uob_account_details(statement: Statement,
     currency = account_dict.pop('currency')
     account_type, account_name, account_number = (supplement_info.text
                                                   .split(supplement_info.line_break_char))
-    account, account_created = Account.objects.get_or_create(type=account_type,
-                                                             name=account_name,
+    account, account_created = Account.objects.get_or_create(name=account_name,
                                                              number=account_number,
                                                              holder=holder,
                                                              provider=provider,
-                                                             currency=currency)
+                                                             defaults={
+                                                                 'type': account_type,
+                                                                 'currency': currency
+                                                             })
     account_statement, account_statement_created = (InstrumentStatement.objects
                                                     .get_or_create(instrument_content_type=account_content_type,
                                                                    instrument_id=account.id,

@@ -12,7 +12,7 @@ from components.models import FinancialInstitution, \
     AccountSnapshot, AccountTransaction
 
 
-def parse_posb_account_transactions(file_name: str, holder: InstrumentHolder, currency: str, rows: list):
+def parse_posb_account_transactions(file_name: str, holder: InstrumentHolder, rows: list):
     # Financial institution and account
     account_details = re.search('^(\\w+) ([\\w\\s]+?) (\\w+) Account ([\\d-]+)$', rows[0][1])
     fi, fi_created = FinancialInstitution.objects.get_or_create(abbreviation=account_details.group(1))
@@ -21,8 +21,9 @@ def parse_posb_account_transactions(file_name: str, holder: InstrumentHolder, cu
                                                              provider=fi,
                                                              name=account_details.group(2),
                                                              number=account_details.group(4),
-                                                             currency=currency,
-                                                             type=account_details.group(3))
+                                                             defaults={
+                                                                 'type': account_details.group(3)
+                                                             })
 
     # Statement
     statement_date = datetime.strptime(rows[1][1].strip(), '%d %b %Y').date()
