@@ -1,3 +1,5 @@
+import decimal
+import logging
 import re
 from datetime import datetime
 from decimal import Decimal
@@ -7,8 +9,6 @@ from django.contrib.contenttypes.models import ContentType
 from pdf_reader.custom_dataclasses import ExtractedPage, \
     ExtractedTable, \
     PdfParagraph, \
-    LineItem, \
-    BaseElementGroup, \
     ExtractedPdfElement
 
 from components.models import FinancialInstitution, \
@@ -31,12 +31,13 @@ def parse_uob_account_statement(file_name, pages: List[ExtractedPage], fi: Finan
 def parse_uob_account_metadata(file_name: str, first_page: ExtractedPage, fi: FinancialInstitution):
     # Instrument holder name
     first_page_first_element_words = first_page.elements[0].get_text().split(' ')
-    instrument_holder_name = ' '.join([word.capitalize() for word in first_page_first_element_words[1:]])
+    instrument_holder_name = ' '.join([word.capitalize() for word in first_page_first_element_words if
+                                       word not in ['MR', 'MRS', 'MDM', 'MS']])
 
     # Instrument holder address
     first_page_third_element = first_page.elements[2].get_text()
     for item in cast(ExtractedTable, first_page.elements[3]).items:
-        first_page_third_element += ' ' + item.base_element_groups.pop().text
+        first_page_third_element += ' ' + [group for group in item.base_element_groups if group.text != 'Call'][0].text
     holder_address_text = ' '.join([word.capitalize() for word in first_page_third_element.split(' ')])
     holder_address, holder_address_created = Address.objects.get_or_create(full_address=holder_address_text)
     holder, holder_created = InstrumentHolder.objects.get_or_create(full_name=instrument_holder_name,
@@ -160,25 +161,40 @@ def parse_uob_account_transactions(pages: List[ExtractedPage], account_snapshots
 
     for page in pages:
         transaction_tables = []
+        last_transaction_table = None
         for element in page.elements:
             if found_end_of_summary and not found_end_of_transactions:
                 if isinstance(element, ExtractedTable):
                     table_area = element.table_area
-                    transaction_tables.append({
-                        'table': element,
+                    last_transaction_table = {
                         'table_x_begin_coor': table_area.x0,
                         'table_x_end_coor': table_area.x1,
-                        'table_y_begin_coor': table_area.y0,
-                        'table_y_end_coor': table_area.y1,
-                        'excluded_groups': []
-                    })
-                else:
-                    for table_properties in transaction_tables:
-                        if (element.x0 >= table_properties['table_x_begin_coor'] and
-                                element.x1 <= table_properties['table_x_end_coor'] and
-                                element.y0 >= table_properties['table_y_begin_coor'] and
-                                element.y1 <= table_properties['table_y_end_coor']):
-                            table_properties['excluded_groups'].append(element.el)
+                        'table_element_groups': {}
+                    }
+
+                    # Add groups to dict by y0
+                    for item in element.items:
+                        y_coor = item.el.y0
+                        base_groups = item.base_element_groups
+                        for base_group in base_groups:
+                            if y_coor not in last_transaction_table['table_element_groups']:
+                                last_transaction_table['table_element_groups'][y_coor] = []
+                            last_transaction_table['table_element_groups'][y_coor].append(base_group)
+
+                        values = item.values
+                        for value in values:
+                            if value.el is not None:
+                                if value.el.y0 not in last_transaction_table['table_element_groups']:
+                                    last_transaction_table['table_element_groups'][value.el.y0] = []
+                                last_transaction_table['table_element_groups'][value.el.y0].append(value.el)
+
+                    transaction_tables.append(last_transaction_table)
+                elif (last_transaction_table is not None and
+                      element.x0 >= last_transaction_table['table_x_begin_coor'] and
+                      element.x1 <= last_transaction_table['table_x_end_coor']):
+                    if element.y0 not in last_transaction_table['table_element_groups']:
+                        last_transaction_table['table_element_groups'][element.y0] = []
+                    last_transaction_table['table_element_groups'][element.y0].append(element.el)
 
             if (type(element) is ExtractedPdfElement and
                     element.el.text == '----------------------------------------------------------------- End of Summary------------------------------------------------------------'):
@@ -189,100 +205,90 @@ def parse_uob_account_transactions(pages: List[ExtractedPage], account_snapshots
 
         # Create transactions for one account
         for table_properties in transaction_tables:
-            transactions_table_items = table_properties['table'].items
-
-            account_number = re.search('.+ ([\\d-]+).*', transactions_table_items[2].el.text).group(1)
-            if account_number not in accounts_with_transactions:
-                accounts_with_transactions[account_number] = []
-
-            # Table header row
-            header_row = transactions_table_items[3]
-            header_groups = merge_row_groups(table_properties['excluded_groups'], header_row)
-            assert len(header_groups) == 5  # UOB transaction table has 5 columns
-
-            date_x_begin_coor = header_groups[0].x0
-            description_x_begin_coor = header_groups[1].x0
-            withdrawals_x_end_coor = header_groups[2].x1
-            deposits_x_end_coor = header_groups[3].x1
-            balance_x_end_coor = header_groups[4].x1
-
-            transaction = None
-            transaction_sub_description_rows = []
-            # Skip row 5
-            for item in transactions_table_items[5:]:
-                date = None
-                description = ''
-                withdrawals = None
-                deposits = None
-                balance = None
-                # Make new transaction
-                row_groups = merge_row_groups(table_properties['excluded_groups'], item)
-                for group in row_groups:
-                    if abs(group.x0 - date_x_begin_coor) < 3:
-                        date = datetime.strptime(f'{group.text} {year}', '%d %b %Y')
-                    elif abs(group.x0 - description_x_begin_coor) < 3:
-                        description = group.text
-                    elif abs(group.x1 - withdrawals_x_end_coor) < 3:
-                        withdrawals = Decimal(group.text.replace(',', ''))
-                    elif abs(group.x1 - deposits_x_end_coor) < 3:
-                        deposits = Decimal(group.text.replace(',', ''))
-                    elif abs(group.x1 - balance_x_end_coor) < 3:
-                        balance = Decimal(group.text.replace(',', ''))
-
-                if balance is not None:
-                    if transaction is not None:
-                        # Add previous transaction to list
-                        add_transaction_to_list(accounts_with_transactions[account_number],
-                                                transaction,
-                                                account_snapshot_content_type,
-                                                transaction_sub_description_rows)
-                        transaction_sub_description_rows = []
-
-                    transaction = {
-                        'snapshot': account_snapshots[account_number],
-                        'date': date,
-                        'description': description,
-                        'amount': withdrawals,
-                        'deposits': deposits,
-                        'balance': balance
-                    }
+            account_number = None
+            account_snapshot = None
+            date_x_begin_coor = None
+            description_x_begin_coor = None
+            withdrawals_x_end_coor = None
+            deposits_x_end_coor = None
+            balance_x_end_coor = None
+            transactions = []
+            transaction_table = dict(sorted(table_properties['table_element_groups'].items(),
+                                            key=lambda el: el[0],
+                                            reverse=True))
+            last_y_coor = 0
+            last_transaction = None
+            for y_coor, element_groups in transaction_table.items():
+                # Determine with transaction to use (previous or create a new one)
+                if abs(last_y_coor - y_coor) < 3:
+                    transaction = last_transaction
                 else:
-                    # sub-description is contained in the description column
-                    transaction_sub_description_rows.append(description)
+                    transaction = {}
 
-            # Add last transaction to list
-            add_transaction_to_list(accounts_with_transactions[account_number],
-                                    transaction,
-                                    account_snapshot_content_type,
-                                    transaction_sub_description_rows)
+                # Add values to transaction
+                for element in element_groups:
+                    account_number_match = re.search('^([\\d-]+).*$', element.text)
+                    if account_number_match is not None and account_number_match.group(1) in account_snapshots:
+                        account_number = account_number_match.group(1)
+                        account_snapshot = account_snapshots[account_number]
+                        if account_number not in accounts_with_transactions:
+                            accounts_with_transactions[account_number] = []
+                    elif element.text == 'Date':
+                        date_x_begin_coor = element.x0
+                    elif element.text == 'Description':
+                        description_x_begin_coor = element.x0
+                    elif element.text == 'Withdrawals':
+                        withdrawals_x_end_coor = element.x1
+                    elif element.text == 'Deposits':
+                        deposits_x_end_coor = element.x1
+                    elif element.text == 'Balance':
+                        balance_x_end_coor = element.x1
+                    elif date_x_begin_coor is not None and abs(element.x0 - date_x_begin_coor) < 3:
+                        transaction['date'] = datetime.strptime(f'{element.text} {year}', '%d %b %Y')
+                    elif description_x_begin_coor is not None and abs(element.x0 - description_x_begin_coor) < 3:
+                        transaction['description'] = element.text
+                    elif withdrawals_x_end_coor is not None and abs(element.x1 - withdrawals_x_end_coor) < 3:
+                        try:
+                            transaction['amount'] = Decimal(element.text.replace(',', ''))
+                        except decimal.InvalidOperation:
+                            logging.debug('Text in "Withdrawals" column is not a numeric value')
+                    elif deposits_x_end_coor is not None and abs(element.x1 - deposits_x_end_coor) < 3:
+                        try:
+                            transaction['deposits'] = Decimal(element.text.replace(',', ''))
+                        except decimal.InvalidOperation:
+                            logging.debug('Text in "Deposits" column is not a numeric value')
+                    elif balance_x_end_coor is not None and abs(element.x1 - balance_x_end_coor) < 3:
+                        try:
+                            transaction['balance'] = Decimal(element.text.replace(',', ''))
+                        except decimal.InvalidOperation:
+                            logging.debug('Text in "Balance" column is not a numeric value')
+
+                # Determine row or sub row
+                if 'balance' not in transaction:
+                    if last_transaction is not None:
+                        if 'sub_description' not in last_transaction:
+                            last_transaction['sub_description'] = []
+                        last_transaction['sub_description'].append(transaction['description'])
+                else:
+                    last_transaction = transaction
+                    transactions.append(last_transaction)
+
+            for transaction in transactions:
+                # Add last transaction to list
+                add_transaction_to_list(accounts_with_transactions[account_number],
+                                        transaction,
+                                        account_snapshot,
+                                        account_snapshot_content_type)
 
     return accounts_with_transactions
 
 
-def merge_row_groups(excluded_groups: List[BaseElementGroup], item: LineItem):
-    groups = list(item.base_element_groups)
-    for header_value in item.values:
-        if header_value.el is not None:
-            groups.append(header_value.el)
-
-    row_y_coor = groups[0].y0
-    for excluded_group in list(excluded_groups):
-        if abs(excluded_group.y0 - row_y_coor) < 3:
-            groups.append(excluded_group)
-            excluded_groups.remove(excluded_group)
-
-    groups.sort(key=lambda e: e.x0)
-
-    return groups
-
-
 def add_transaction_to_list(transactions: List[AccountTransaction],
                             transaction_dict: dict,
-                            account_snapshot_content_type: ContentType,
-                            sub_description_rows: List[str]):
-    account_snapshot = transaction_dict.pop('snapshot')
-    sub_description = '\n'.join(sub_description_rows)
-    transaction_dict['sub_description'] = sub_description
+                            account_snapshot: AccountSnapshot,
+                            account_snapshot_content_type: ContentType):
+    if 'sub_description' in transaction_dict:
+        transaction_dict['sub_description'] = '\n'.join(transaction_dict['sub_description'])
     transaction, transaction_created = (AccountTransaction.objects
                                         .get_or_create(snapshot_content_type=account_snapshot_content_type,
                                                        snapshot_id=account_snapshot.id,
