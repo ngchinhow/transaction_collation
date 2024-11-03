@@ -1,5 +1,7 @@
 import datetime
+import logging
 import re
+import sys
 from decimal import Decimal
 from typing import List, cast
 
@@ -21,11 +23,20 @@ from components.models import FinancialInstitution, \
 
 def parse_uob_card_statement(file_name: str, pages: List[ExtractedPage], fi: FinancialInstitution):
     statement_date = parse_uob_card_statement_month(pages[-1])
-    card_snapshots, summary_end_index, statement_year = parse_uob_card_metadata(file_name,
-                                                                                statement_date,
-                                                                                pages[0],
-                                                                                fi)
-    card_transactions = parse_uob_card_transactions(pages[:-2], card_snapshots, summary_end_index, statement_year)
+    card_content_type = ContentType.objects.get_for_model(Card)
+    card_snapshots, summary_end_index, statement, currency, total_credit_limit = parse_uob_card_metadata(
+        file_name,
+        statement_date,
+        pages[0],
+        fi,
+        card_content_type)
+    card_transactions = parse_uob_card_transactions(pages[:-2],
+                                                    card_snapshots,
+                                                    summary_end_index,
+                                                    statement,
+                                                    currency,
+                                                    card_content_type,
+                                                    total_credit_limit)
 
 
 def parse_uob_card_statement_month(last_page: ExtractedPage):
@@ -38,7 +49,8 @@ def parse_uob_card_statement_month(last_page: ExtractedPage):
 def parse_uob_card_metadata(file_name: str,
                             statement_date: datetime.date,
                             first_page: ExtractedPage,
-                            fi: FinancialInstitution):
+                            fi: FinancialInstitution,
+                            card_content_type: ContentType):
     first_page_second_paragraph = cast(PdfParagraph, first_page.paragraphs[1])
     # Instrument holder name
     instrument_holder_name = ' '.join(word.text.capitalize() for word in
@@ -75,9 +87,17 @@ def parse_uob_card_metadata(file_name: str,
     card_name_x_coor = None
     card_number_x_coor = None
     card_holder_x_coor = None
-    cards = {}
+    cards_by_card_number = {}
+    cards_by_y_coor = {}
+    summary_end_y_coor = None
     summary_end_index = None
-    card_content_type = ContentType.objects.get_for_model(Card)
+
+    # Helper method for preparing cards_by_y_coor
+    def prepare_card_dict(el_y_coor: int, k: str, v: str):
+        if el_y_coor not in cards_by_y_coor:
+            cards_by_y_coor[el_y_coor] = {}
+        cards_by_y_coor[el_y_coor][k] = v
+
     while i < len(first_page_elements):
         element_i = first_page_elements[i]
         if element_i.get_text() == 'Credit Card(s) Statement' and first_page_elements[i + 1].get_text() == 'Summary':
@@ -86,54 +106,87 @@ def parse_uob_card_metadata(file_name: str,
             continue
 
         if found_cards_table:
-            if isinstance(element_i, ExtractedTable):
+            if summary_end_y_coor is not None and element_i.y0 < summary_end_y_coor:
+                summary_end_index = i
+                break
+            elif element_i.get_text() == 'Card Name':
+                card_name_x_coor = element_i.x0
+            elif element_i.get_text() == 'Card Number':
+                card_number_x_coor = element_i.x0
+            elif element_i.get_text() == 'Name on Card':
+                card_holder_x_coor = element_i.x0
+            elif isinstance(element_i, ExtractedTable):
                 for item in element_i.items[:-1]:
-                    card_name = None
-                    card_number = None
+                    y_coor = item.el.y0
                     for group in item.base_element_groups:
                         if group.x0 == card_name_x_coor:
-                            card_name = group.text
+                            prepare_card_dict(y_coor, 'name', group.text)
                         elif group.x0 == card_number_x_coor:
-                            card_number = group.text
+                            prepare_card_dict(y_coor, 'number', group.text)
                         elif group.x0 == card_holder_x_coor:
                             name_on_card = ' '.join([word.capitalize() for word in group.text.split(' ')])
-                            assert name_on_card == instrument_holder_name
-
-                    card, card_created = Card.objects.get_or_create(holder=holder,
-                                                                    provider=fi,
-                                                                    name=card_name,
-                                                                    number=card_number,
-                                                                    currency=currency)
-                    card_statement, card_statement_created = (InstrumentStatement.objects
-                                                              .get_or_create(instrument_content_type=card_content_type,
-                                                                             instrument_id=card.id,
-                                                                             statement=statement))
-                    card_snapshot, card_snapshot_created = (CardSnapshot.objects
-                                                            .get_or_create(instrument_statement=card_statement,
-                                                                           defaults={
-                                                                               'total_credit_limit': total_credit_limit
-                                                                           }))
-                    # Add card to dict
-                    cards[card_number] = card_snapshot
+                            prepare_card_dict(y_coor, 'holder', name_on_card)
+                            assert name_on_card in instrument_holder_name
 
                 # Note where the summary ends
-                summary_end_index = i
-                # Stop for the scope of this function
-                break
-            else:
-                match element_i.get_text():
-                    case 'Card Name':
-                        card_name_x_coor = element_i.x0
-                    case 'Card Number':
-                        card_number_x_coor = element_i.x0
-                    case 'Name on Card':
-                        card_holder_x_coor = element_i.x0
+                summary_end_y_coor = element_i.items[-1].el.y0
+            elif card_name_x_coor is not None and element_i.x0 == card_name_x_coor:
+                prepare_card_dict(element_i.y0, 'name', element_i.get_text())
+            elif card_number_x_coor is not None and element_i.x0 == card_number_x_coor:
+                prepare_card_dict(element_i.y0, 'number', element_i.get_text())
+            elif card_holder_x_coor is not None and element_i.x0 == card_holder_x_coor:
+                name_on_card = ' '.join([word.capitalize() for word in element_i.get_text().split(' ')])
+                prepare_card_dict(element_i.y0, 'holder', name_on_card)
+
         i += 1
 
-    return cards, summary_end_index, statement_date.year
+    # Group card details that spread across multiple lines
+    last_y_coor = sys.maxsize
+    last_card_dict = None
+    grouped_card_details = []
+    for y_coor, card_dict in cards_by_y_coor.items():
+        if last_y_coor - y_coor < 12:
+            for key, value in last_card_dict.items():
+                if key in card_dict:
+                    last_card_dict[key] += ' ' + card_dict[key]
+        else:
+            if last_card_dict is not None:
+                grouped_card_details.append(last_card_dict)
+            else:
+                grouped_card_details.append(card_dict)
+            last_card_dict = card_dict
+        last_y_coor = y_coor
+
+    # Persist card details
+    for card_detail in grouped_card_details:
+        card, card_created = Card.objects.get_or_create(holder=holder,
+                                                        provider=fi,
+                                                        name=card_detail['name'],
+                                                        name_on_card=card_detail['holder'],
+                                                        number=card_detail['number'],
+                                                        currency=currency)
+        card_statement, card_statement_created = (InstrumentStatement.objects
+                                                  .get_or_create(instrument_content_type=card_content_type,
+                                                                 instrument_id=card.id,
+                                                                 statement=statement))
+        card_snapshot, card_snapshot_created = (CardSnapshot.objects
+                                                .get_or_create(instrument_statement=card_statement,
+                                                               defaults={
+                                                                   'total_credit_limit': total_credit_limit
+                                                               }))
+        # Add card to dict
+        cards_by_card_number[card_detail['number']] = card_snapshot
+
+    return cards_by_card_number, summary_end_index, statement, currency, total_credit_limit
 
 
-def parse_uob_card_transactions(pages: List[ExtractedPage], card_snapshots: dict, summary_end_index: int, year: int):
+def parse_uob_card_transactions(pages: List[ExtractedPage],
+                                card_snapshots: dict,
+                                summary_end_index: int,
+                                statement: Statement,
+                                currency: str,
+                                card_content_type: ContentType,
+                                total_credit_limit: Decimal):
     card_with_transactions = {}
     latest_card_snapshot = None
     found_end_of_transactions = False
@@ -162,28 +215,34 @@ def parse_uob_card_transactions(pages: List[ExtractedPage], card_snapshots: dict
                   (card_number_match := re.search(card_transaction_header_pattern, element.el.text))):
                 # Find table coordinates and prepare to gather elements
                 card_number = card_number_match.group(1)
+                card_name = elements[elements_index - 1].get_text()
                 if card_number not in card_snapshots:
                     # Card is a supplementary card
-                    holder_name = ' '.join([word.capitalize() for word in
-                                            card_number_match.group(2).rstrip().split(' ')])
-                    holder, holder_created = InstrumentHolder.objects.get_or_create(full_name=holder_name)
+                    name_on_card = ' '.join([word.capitalize() for word in
+                                             card_number_match.group(2).rstrip().split(' ')])
 
-                    latest_card_statement = latest_card_snapshot.instrument_statement
-                    latest_card = latest_card_statement.instrument
-                    card, card_created = Card.objects.get_or_create(holder=holder,
-                                                                    provider=latest_card.provider,
-                                                                    name=latest_card.name,
+                    parent_card = None
+                    if latest_card_snapshot is not None:
+                        latest_card = latest_card_snapshot.instrument_statement.instrument
+                        parent_card = latest_card if latest_card.name == card_name else None
+
+                    card, card_created = Card.objects.get_or_create(holder=statement.holder,
+                                                                    provider=statement.provider,
+                                                                    name=card_name,
                                                                     number=card_number,
-                                                                    currency=latest_card.currency,
-                                                                    parent=latest_card)
+                                                                    name_on_card=name_on_card,
+                                                                    currency=currency,
+                                                                    defaults={
+                                                                        'parent': parent_card
+                                                                    })
                     card_statement, card_statement_created = (InstrumentStatement.objects
-                                                              .get_or_create(instrument_content_type=latest_card_statement.instrument_content_type,
+                                                              .get_or_create(instrument_content_type=card_content_type,
                                                                              instrument_id=card.id,
-                                                                             statement=latest_card_statement.statement))
+                                                                             statement=statement))
                     card_snapshot, card_snapshot_created = (CardSnapshot.objects
                                                             .get_or_create(instrument_statement=card_statement,
                                                                            defaults={
-                                                                               'total_credit_limit': latest_card_snapshot.total_credit_limit
+                                                                               'total_credit_limit': total_credit_limit
                                                                            }))
                     latest_card_snapshot = card_snapshot
                 else:
@@ -210,7 +269,11 @@ def parse_uob_card_transactions(pages: List[ExtractedPage], card_snapshots: dict
                   element.x0 > amount_x_start_coor and
                   element.x1 >= amount_x_end_coor and
                   element.y0 != date_currency_y_coor):
-                latest_transaction_rows[element.y0]['amount'] = element.el
+                for y_coor in range(element.y0 - element.tolerance_detection, element.y0 + element.tolerance_detection):
+                    try:
+                        latest_transaction_rows[y_coor]['amount'] = element.el
+                    except KeyError:
+                        logging.debug(f'Y coordinate does not exist for value {y_coor}')
 
             elif type(element) is ExtractedTable and element.x0 >= description_x_coor:
                 # Description + transaction amount table
@@ -231,7 +294,7 @@ def parse_uob_card_transactions(pages: List[ExtractedPage], card_snapshots: dict
                         value_el = value.el
                         y_coor = value_el.y0
                         field_name = 'post_date' if j == 0 else 'date'
-                        date_value = datetime.datetime.strptime(f'{value_el.text} {year}', '%d %b %Y')
+                        date_value = datetime.datetime.strptime(f'{value_el.text} {statement.date.year}', '%d %b %Y')
                         if y_coor not in latest_transaction_rows:
                             latest_transaction_rows[y_coor] = {}
                         latest_transaction_rows[y_coor][field_name] = date_value

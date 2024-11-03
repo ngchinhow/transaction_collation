@@ -5,7 +5,6 @@ import django
 import pytesseract.pytesseract
 from pdf_reader import get_elements_from_pdf
 
-
 django.setup()
 
 from document_consumer.ocbc.factory import parse_ocbc_statement
@@ -39,4 +38,4 @@ def parse_statement(file_name):
                 parse_posb_account_transactions(file_stem, InstrumentHolder.objects.get(pk=1), 'SGD', collected_rows)
 
 
-parse_statement('C:\\Users\\AmideWing\\Downloads\\Telegram Desktop\\eStatement_3589.8688804110357.pdf')
+parse_statement('D:\\Projects\\transaction_collation\\statements\\rachael\\UOB\\eStatement_2545.3485391645804.pdf')

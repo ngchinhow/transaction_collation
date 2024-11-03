@@ -101,11 +101,13 @@ class Account(Instrument):
 
 class Card(Instrument):
     parent = models.ForeignKey("self", null=True, on_delete=models.SET_NULL)
+    name_on_card = models.CharField(max_length=255)
 
     class Meta:
         db_table = 'project_card'
         constraints = [
-            models.UniqueConstraint(name='unique_card', fields=['holder', 'provider', 'name', 'number', 'currency'])
+            models.UniqueConstraint(name='unique_card',
+                                    fields=['holder', 'provider', 'name', 'name_on_card', 'number', 'currency'])
         ]
 
 
