@@ -38,4 +38,4 @@ def parse_statement(file_name):
                 parse_posb_account_transactions(file_stem, InstrumentHolder.objects.get(pk=1), 'SGD', collected_rows)
 
 
-parse_statement('D:\\Projects\\transaction_collation\\statements\\rachael\\UOB\\eStatement_2545.3485391645804.pdf')
+parse_statement('D:\\Projects\\transaction_collation\\statements\\rachael\\UOB\\eStatement_16487.838218466066.pdf')

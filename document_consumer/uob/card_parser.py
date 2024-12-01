@@ -1,4 +1,5 @@
 import datetime
+import decimal
 import logging
 import re
 import sys
@@ -92,12 +93,6 @@ def parse_uob_card_metadata(file_name: str,
     summary_end_y_coor = None
     summary_end_index = None
 
-    # Helper method for preparing cards_by_y_coor
-    def prepare_card_dict(el_y_coor: int, k: str, v: str):
-        if el_y_coor not in cards_by_y_coor:
-            cards_by_y_coor[el_y_coor] = {}
-        cards_by_y_coor[el_y_coor][k] = v
-
     while i < len(first_page_elements):
         element_i = first_page_elements[i]
         if element_i.get_text() == 'Credit Card(s) Statement' and first_page_elements[i + 1].get_text() == 'Summary':
@@ -120,23 +115,23 @@ def parse_uob_card_metadata(file_name: str,
                     y_coor = item.el.y0
                     for group in item.base_element_groups:
                         if group.x0 == card_name_x_coor:
-                            prepare_card_dict(y_coor, 'name', group.text)
+                            prepare_card_dict(cards_by_y_coor, y_coor, 'name', group.text)
                         elif group.x0 == card_number_x_coor:
-                            prepare_card_dict(y_coor, 'number', group.text)
+                            prepare_card_dict(cards_by_y_coor, y_coor, 'number', group.text)
                         elif group.x0 == card_holder_x_coor:
                             name_on_card = ' '.join([word.capitalize() for word in group.text.split(' ')])
-                            prepare_card_dict(y_coor, 'holder', name_on_card)
+                            prepare_card_dict(cards_by_y_coor, y_coor, 'holder', name_on_card)
                             assert name_on_card in instrument_holder_name
 
                 # Note where the summary ends
                 summary_end_y_coor = element_i.items[-1].el.y0
             elif card_name_x_coor is not None and element_i.x0 == card_name_x_coor:
-                prepare_card_dict(element_i.y0, 'name', element_i.get_text())
+                prepare_card_dict(cards_by_y_coor, element_i.y0, 'name', element_i.get_text())
             elif card_number_x_coor is not None and element_i.x0 == card_number_x_coor:
-                prepare_card_dict(element_i.y0, 'number', element_i.get_text())
+                prepare_card_dict(cards_by_y_coor, element_i.y0, 'number', element_i.get_text())
             elif card_holder_x_coor is not None and element_i.x0 == card_holder_x_coor:
                 name_on_card = ' '.join([word.capitalize() for word in element_i.get_text().split(' ')])
-                prepare_card_dict(element_i.y0, 'holder', name_on_card)
+                prepare_card_dict(cards_by_y_coor, element_i.y0, 'holder', name_on_card)
 
         i += 1
 
@@ -198,10 +193,31 @@ def parse_uob_card_transactions(pages: List[ExtractedPage],
         transaction_tables = {}
         latest_transaction_rows = {}
         elements_index = summary_end_index + 1 if i == 0 else 0
-        date_currency_y_coor = None  # y coordinate of second row of header row
+        post_x_coor = None
+        trans_x_coor = None
+        date_currency_y_coor = None
         description_x_coor = None
         amount_x_start_coor = None
         amount_x_end_coor = None
+
+        def parse_element_into_field(inner_group: BaseElementGroup):
+            if (post_x_coor is not None and
+                    abs(inner_group.x0 - post_x_coor) <= 2 < abs(inner_group.y0 - date_currency_y_coor)):
+                # Post date
+                extract_date(inner_group, latest_transaction_rows, statement.date.year, 'post_date')
+            elif (trans_x_coor is not None and
+                  abs(inner_group.x0 - trans_x_coor) <= 2 < abs(inner_group.y0 - date_currency_y_coor)):
+                # Transaction date
+                extract_date(inner_group, latest_transaction_rows, statement.date.year, 'date')
+            elif description_x_coor is not None and inner_group.x0 == description_x_coor:
+                # Description
+                extract_description(inner_group, latest_transaction_rows)
+            elif (amount_x_start_coor is not None and
+                  amount_x_end_coor is not None and
+                  inner_group.x1 >= amount_x_end_coor and
+                  abs(inner_group.y0 - date_currency_y_coor) > 2):
+                # Amount
+                extract_credit_card_amount(inner_group, latest_transaction_rows)
 
         # Find transaction tables
         while elements_index < len(elements) and not found_end_of_transactions:
@@ -249,55 +265,32 @@ def parse_uob_card_transactions(pages: List[ExtractedPage],
                     latest_card_snapshot = card_snapshots[card_number]
                 if latest_card_snapshot not in card_with_transactions:
                     card_with_transactions[latest_card_snapshot] = []
-                description_x_coor = elements[elements_index + 3].x0
-                amount_x_start_coor = elements[elements_index + 4].x0
-                amount_x_end_coor = elements[elements_index + 4].x1
-                date_currency_y_coor = elements[elements_index + 5].y0
                 transaction_tables[latest_card_snapshot] = {}
                 latest_transaction_rows = transaction_tables[latest_card_snapshot]
-                elements_index += 6  # increment by 1 less because it will be incremented again later
 
-            elif type(element) is ExtractedPdfElement and element.x0 == description_x_coor:
-                if element.y0 not in latest_transaction_rows:
-                    latest_transaction_rows[element.y0] = {}
-                latest_transaction_rows[element.y0]['description'] = element.el
-
-            elif (type(element) is ExtractedPdfElement and
-                  amount_x_start_coor is not None and
-                  amount_x_end_coor is not None and
-                  date_currency_y_coor is not None and
-                  element.x0 > amount_x_start_coor and
-                  element.x1 >= amount_x_end_coor and
-                  element.y0 != date_currency_y_coor):
-                for y_coor in range(element.y0 - element.tolerance_detection, element.y0 + element.tolerance_detection):
-                    try:
-                        latest_transaction_rows[y_coor]['amount'] = element.el
-                    except KeyError:
-                        logging.debug(f'Y coordinate does not exist for value {y_coor}')
-
-            elif type(element) is ExtractedTable and element.x0 >= description_x_coor:
+            elif element.get_text() == 'Post':
+                post_x_coor = element.x0
+                date_currency_y_coor = element.y0 - 8
+            elif element.get_text() == 'Trans':
+                trans_x_coor = element.x0
+                date_currency_y_coor = element.y0 - 8
+            elif element.get_text() == 'Description of Transaction':
+                description_x_coor = element.x0
+            elif element.get_text() == 'Transaction Amount':
+                amount_x_start_coor = element.x0
+                amount_x_end_coor = element.x1
+            elif type(element) is ExtractedPdfElement:
+                parse_element_into_field(cast(BaseElementGroup, element.el))
+            elif type(element) is ExtractedTable:
                 # Description + transaction amount table
-                description_items = cast(ExtractedTable, element).items[1:]
+                description_items = cast(ExtractedTable, element).items
                 for item in description_items:
-                    description_element_group = item.el
-                    y_coor = description_element_group.y0
-                    if y_coor not in latest_transaction_rows:
-                        latest_transaction_rows[y_coor] = {}
+                    for group in item.base_element_groups:
+                        parse_element_into_field(group)
 
-                    latest_transaction_rows[y_coor]['description'] = description_element_group
-                    latest_transaction_rows[y_coor]['amount'] = item.values[0].el
-
-            elif type(element) is ExtractedTable and element.x0 < description_x_coor:
-                # Post + trans dates table
-                for item in cast(ExtractedTable, element).items:
-                    for j, value in enumerate(item.values):
-                        value_el = value.el
-                        y_coor = value_el.y0
-                        field_name = 'post_date' if j == 0 else 'date'
-                        date_value = datetime.datetime.strptime(f'{value_el.text} {statement.date.year}', '%d %b %Y')
-                        if y_coor not in latest_transaction_rows:
-                            latest_transaction_rows[y_coor] = {}
-                        latest_transaction_rows[y_coor][field_name] = date_value
+                    for value in item.values:
+                        if value.el is not None:
+                            parse_element_into_field(value.el)
 
             elements_index += 1
 
@@ -306,30 +299,25 @@ def parse_uob_card_transactions(pages: List[ExtractedPage],
             transactions_on_card = card_with_transactions[snapshot]
             # Sort via descending y value (top of page to bottom)
             table_rows = dict(sorted(table_rows.items(), key=lambda el: el[0], reverse=True))
+            last_y_coor = None
             last_transaction = None
-            for transaction in table_rows.values():
-                if 'amount' in transaction and transaction['amount'] is not None:
-                    # Beginning of a new transaction
-
+            for y_coor, transaction_dict in table_rows.items():
+                if last_y_coor is not None and last_y_coor - y_coor <= 10:
+                    # Merge rows that did not get parsed into the same logical row
+                    if 'description' in transaction_dict:
+                        if 'sub_description' not in last_transaction:
+                            last_transaction['sub_description'] = []
+                        last_transaction['sub_description'].append(transaction_dict.pop('description'))
+                    last_transaction = last_transaction | transaction_dict
+                else:
                     # Save previous transaction
                     if last_transaction is not None:
                         last_transaction['row_number'] = len(transactions_on_card) + 1
                         transactions_on_card.append(last_transaction)
+                    # Beginning of a new transaction
+                    last_transaction = transaction_dict
 
-                    # Create new transaction
-                    transaction['description'] = transaction['description'].text
-                    amount_elements = transaction.pop('amount').elements
-                    amount_elements_decimal = Decimal(amount_elements[0].text.replace(',', ''))
-                    if len(amount_elements) == 2 and amount_elements[1].text == 'CR':
-                        transaction['cash_rebate'] = amount_elements_decimal
-                    else:
-                        transaction['amount'] = amount_elements_decimal
-
-                    transaction['sub_description'] = ''
-                    last_transaction = transaction
-                else:
-                    # Sub-description row
-                    last_transaction['sub_description'] += transaction['description'].text + '\n'
+                last_y_coor = y_coor
 
             # Save last transaction
             last_transaction['row_number'] = len(transactions_on_card) + 1
@@ -340,6 +328,8 @@ def parse_uob_card_transactions(pages: List[ExtractedPage],
     for snapshot, transactions_list in card_with_transactions.items():
         snapshot_to_transactions[snapshot] = []
         for transaction_dict in transactions_list:
+            if 'sub_description' in transaction_dict:
+                transaction_dict['sub_description'] = '\n'.join(transaction_dict['sub_description'])
             transaction, transaction_created = (CardTransaction.objects
                                                 .get_or_create(snapshot_content_type=card_snapshot_content_type,
                                                                snapshot_id=snapshot.id,
@@ -349,3 +339,40 @@ def parse_uob_card_transactions(pages: List[ExtractedPage],
             snapshot_to_transactions[snapshot].append(transaction)
 
     return snapshot_to_transactions
+
+
+def extract_date(group: BaseElementGroup, rows: dict, year: int, key: str):
+    try:
+        date = datetime.datetime.strptime(f'{group.text} {year}', '%d %b %Y')
+    except ValueError:
+        logging.debug(f'String \'{group.text}\' is not a date value.')
+        return
+    prepare_card_dict(rows, group.y0, key, date)
+
+
+def extract_description(group: BaseElementGroup, rows: dict):
+    prepare_card_dict(rows, group.y0, 'description', group.text)
+
+
+def extract_credit_card_amount(group: BaseElementGroup, rows: dict):
+    elements = group.elements
+    if len(group.elements) > 2:
+        return
+    group.elements.sort(key=lambda e: e.x0)
+    if len(elements) == 2 and elements[1].text == 'CR':
+        key = 'cash_rebate'
+    else:
+        key = 'amount'
+    try:
+        amount = Decimal(elements[0].text.replace(',', ''))
+    except decimal.InvalidOperation:
+        logging.debug(f'String {elements[0].text} is not a numeric value.')
+        return
+    prepare_card_dict(rows, group.y0, key, amount)
+
+
+# Helper method for preparing table rows
+def prepare_card_dict(rows: dict, el_y_coor: int, k: str, v: any):
+    if el_y_coor not in rows:
+        rows[el_y_coor] = {}
+    rows[el_y_coor][k] = v
